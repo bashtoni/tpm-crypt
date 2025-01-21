@@ -1,0 +1,106 @@
+#!/bin/bash
+
+# (C) Copyright Corrected Cloud Pty Ltd 2025
+# License: MIT
+
+set -euo pipefail
+
+KEY_DIR="$HOME/.config/tpm-crypto"
+
+# Function to display usage
+usage() {
+    echo "Usage:"
+    echo "  $0 encrypt <output_file>    # reads from stdin"
+    echo "  $0 decrypt <input_file>     # writes to stdout"
+    echo ""
+    echo "The script will create/use a TPM-protected key in $KEY_DIR"
+    exit 1
+}
+
+# Function to initialize TPM keys if they don't exist
+init_tpm_keys() {
+    mkdir -p "$KEY_DIR"
+    
+    # Create primary key if it doesn't exist
+    if [ ! -f "$KEY_DIR/primary.ctx" ]; then
+        tpm2_createprimary -C o -g sha256 -G rsa -c "$KEY_DIR/primary.ctx"
+    fi
+    
+    # Create encryption key if it doesn't exist
+    if [ ! -f "$KEY_DIR/key.pub" ] || [ ! -f "$KEY_DIR/key.priv" ]; then
+        tpm2_create -C "$KEY_DIR/primary.ctx" -g sha256 -G rsa \
+            -u "$KEY_DIR/key.pub" -r "$KEY_DIR/key.priv"
+    fi
+    
+}
+
+encrypt_file() {
+    local output="$1"
+    local TEMP_DIR=$(mktemp -d)
+
+    # Generate a random AES key in memory
+    local AES_KEY=$(openssl rand -hex 32)
+
+    # Encrypt the AES key with TPM
+    echo -n "$AES_KEY" | tpm2_rsaencrypt -c "$KEY_DIR/key.ctx" -o "$TEMP_DIR/aes.key.enc"
+
+    # Encrypt stdin with the AES key using PBKDF2
+    openssl enc -aes-256-cbc -pbkdf2 -iter 100000 \
+        -out "$TEMP_DIR/file.enc" \
+        -pass "pass:$AES_KEY"
+
+    # Combine the encrypted AES key and encrypted file
+    cat "$TEMP_DIR/aes.key.enc" "$TEMP_DIR/file.enc" > "$output"
+}
+
+decrypt_file() {
+    local input="$1"
+    local TEMP_DIR=$(mktemp -d)
+
+    # Extract the encrypted AES key (first 256 bytes)
+    dd if="$input" of="$TEMP_DIR/aes.key.enc" bs=256 count=1 2>/dev/null
+
+    # Extract the encrypted file (everything after 256 bytes)
+    dd if="$input" of="$TEMP_DIR/file.enc" bs=256 skip=1 2>/dev/null
+
+    # Decrypt the AES key with TPM
+    local AES_KEY=$(tpm2_rsadecrypt -c "$KEY_DIR/key.ctx" "$TEMP_DIR/aes.key.enc" 2>/dev/null)
+
+    # Decrypt the file with the AES key using PBKDF2 to stdout
+    openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -d \
+        -in "$TEMP_DIR/file.enc" \
+        -pass "pass:$AES_KEY"
+
+
+    # Clean up
+    rm -rf "$TEMP_DIR"
+}
+
+
+# Main script
+if [ $# -ne 2 ]; then
+    usage
+fi
+
+command="$1"
+file="$2"
+
+# Initialize TPM keys
+init_tpm_keys
+
+# Process command
+case "$command" in
+    "encrypt")
+        encrypt_file "$file"
+        ;;
+    "decrypt")
+        if [ ! -f "$file" ]; then
+            echo "Error: Input file '$file' does not exist" >&2
+            exit 1
+        fi
+        decrypt_file "$file"
+        ;;
+    *)
+        usage
+        ;;
+esac
