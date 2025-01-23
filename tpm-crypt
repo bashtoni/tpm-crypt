@@ -21,18 +21,19 @@ init_tpm_keys() {
     mkdir -p "$KEY_DIR"
     chmod 700 "$KEY_DIR"
     
-    # Create primary key if missing
-    [ ! -f "$KEY_DIR/primary.ctx" ] && tpm2_createprimary -C o -g sha256 -G rsa -c "$KEY_DIR/primary.ctx"
     
     # Create encryption key if missing
     if [ ! -f "$KEY_DIR/key.pub" ] || [ ! -f "$KEY_DIR/key.priv" ]; then
-        tpm2_create -C "$KEY_DIR/primary.ctx" -g sha256 -G rsa \
+        tpm2_createprimary -C o -g sha256 -G rsa -c "$KEY_DIR/primary.ctx"
+        tpm2_evictcontrol -C o -c "$KEY_DIR/primary.ctx" 0x81000000
+        rm "$KEY_DIR/primary.ctx"  # Remove transient context file
+        tpm2_create -C 0x81000000 -g sha256 -G rsa \
             -u "$KEY_DIR/key.pub" -r "$KEY_DIR/key.priv"
         chmod 600 "$KEY_DIR"/*
     fi
 
-    # Always load fresh handle (remove key.handle file check)
-    tpm2_load -C "$KEY_DIR/primary.ctx" -u "$KEY_DIR/key.pub" -r "$KEY_DIR/key.priv" -c "$KEY_DIR/key.handle" 2>&1 > /dev/null
+    # Load fresh handle each time
+    tpm2_load -C 0x81000000 -u "$KEY_DIR/key.pub" -r "$KEY_DIR/key.priv" -c "$KEY_DIR/key.handle" 2>&1 > /dev/null
 }
 
 encrypt_file() {
