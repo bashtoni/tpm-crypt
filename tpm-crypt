@@ -17,37 +17,39 @@ usage() {
     exit 1
 }
 
-# Function to initialize TPM keys if they don't exist
 init_tpm_keys() {
     mkdir -p "$KEY_DIR"
+    chmod 700 "$KEY_DIR"
     
-    # Create primary key if it doesn't exist
-    if [ ! -f "$KEY_DIR/primary.ctx" ]; then
-        tpm2_createprimary -C o -g sha256 -G rsa -c "$KEY_DIR/primary.ctx"
-    fi
+    # Create primary key if missing
+    [ ! -f "$KEY_DIR/primary.ctx" ] && tpm2_createprimary -C o -g sha256 -G rsa -c "$KEY_DIR/primary.ctx"
     
-    # Create encryption key if it doesn't exist
+    # Create encryption key if missing
     if [ ! -f "$KEY_DIR/key.pub" ] || [ ! -f "$KEY_DIR/key.priv" ]; then
         tpm2_create -C "$KEY_DIR/primary.ctx" -g sha256 -G rsa \
             -u "$KEY_DIR/key.pub" -r "$KEY_DIR/key.priv"
+        chmod 600 "$KEY_DIR"/*
     fi
-    
+
+    # Always load fresh handle (remove key.handle file check)
+    tpm2_load -C "$KEY_DIR/primary.ctx" -u "$KEY_DIR/key.pub" -r "$KEY_DIR/key.priv" -c "$KEY_DIR/key.handle" 2>&1 > /dev/null
 }
 
 encrypt_file() {
     local output="$1"
     local TEMP_DIR=$(mktemp -d)
+    trap 'rm -rf "$TEMP_DIR"' RETURN
 
     # Generate a random AES key in memory
-    local AES_KEY=$(openssl rand -hex 32)
+    export AES_KEY=$(openssl rand -hex 32)
 
     # Encrypt the AES key with TPM
-    echo -n "$AES_KEY" | tpm2_rsaencrypt -c "$KEY_DIR/key.ctx" -o "$TEMP_DIR/aes.key.enc"
+    echo -n "$AES_KEY" | tpm2_rsaencrypt -c "$KEY_DIR/key.handle" -o "$TEMP_DIR/aes.key.enc"
 
     # Encrypt stdin with the AES key using PBKDF2
-    openssl enc -aes-256-cbc -pbkdf2 -iter 100000 \
+    openssl enc -aes-256-cbc -pbkdf2 -iter 600000 \
         -out "$TEMP_DIR/file.enc" \
-        -pass "pass:$AES_KEY"
+        -pass env:AES_KEY
 
     # Combine the encrypted AES key and encrypted file
     cat "$TEMP_DIR/aes.key.enc" "$TEMP_DIR/file.enc" > "$output"
@@ -56,6 +58,7 @@ encrypt_file() {
 decrypt_file() {
     local input="$1"
     local TEMP_DIR=$(mktemp -d)
+    trap 'rm -rf "$TEMP_DIR"' RETURN
 
     # Extract the encrypted AES key (first 256 bytes)
     dd if="$input" of="$TEMP_DIR/aes.key.enc" bs=256 count=1 2>/dev/null
@@ -64,18 +67,16 @@ decrypt_file() {
     dd if="$input" of="$TEMP_DIR/file.enc" bs=256 skip=1 2>/dev/null
 
     # Decrypt the AES key with TPM
-    local AES_KEY=$(tpm2_rsadecrypt -c "$KEY_DIR/key.ctx" "$TEMP_DIR/aes.key.enc" 2>/dev/null)
+    export AES_KEY=$(tpm2_rsadecrypt -c "$KEY_DIR/key.handle" "$TEMP_DIR/aes.key.enc" 2>/dev/null)
 
     # Decrypt the file with the AES key using PBKDF2 to stdout
-    openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -d \
+    openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -d \
         -in "$TEMP_DIR/file.enc" \
-        -pass "pass:$AES_KEY"
-
+        -pass env:AES_KEY
 
     # Clean up
     rm -rf "$TEMP_DIR"
 }
-
 
 # Main script
 if [ $# -ne 2 ]; then
